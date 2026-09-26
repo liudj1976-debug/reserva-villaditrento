@@ -1,0 +1,35 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function role() { return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role : null; }
+    function isSindico() { return role() == 'sindico'; }
+    function isPortaria() { return role() == 'portaria' || isSindico(); }
+    function ownsUser(userId) { return signedIn() && request.auth.uid == userId; }
+    match /users/{userId} {
+      allow get: if ownsUser(userId) || isSindico();
+      allow create: if ownsUser(userId) && request.resource.data.role == 'resident' && request.resource.data.email == request.auth.token.email;
+      allow update, delete: if isSindico();
+      allow list: if isSindico();
+    }
+    match /reservations/{reservationId} { allow create: if signedIn() && request.resource.data.userId == request.auth.uid; allow get, list: if isSindico() || (signedIn() && resource.data.userId == request.auth.uid); allow update, delete: if isSindico(); }
+    match /blocked_dates/{id} { allow read: if true; allow write: if isSindico(); }
+    match /config/{id} { allow read: if true; allow write: if isSindico(); }
+    match /feedbacks/{id} { allow create: if signedIn() && request.resource.data.userId == request.auth.uid; allow read: if isSindico() || (signedIn() && resource.data.userId == request.auth.uid); allow update, delete: if isSindico(); }
+    match /residents/{id} { allow read, write: if isPortaria(); }
+    match /packages/{id} { allow read, write: if isPortaria(); }
+    match /admins/{id} { allow read, write: if isSindico(); }
+    match /availability/{id} {
+      allow read: if true;
+      allow create: if isSindico() || (signedIn()
+        && request.resource.data.keys().hasOnly(['spaceName', 'date', 'status', 'reservationId', 'updatedAt'])
+        && request.resource.data.status == 'reserved'
+        && request.resource.data.reservationId is string
+        && getAfter(/databases/$(database)/documents/reservations/$(request.resource.data.reservationId)).data.userId == request.auth.uid
+        && getAfter(/databases/$(database)/documents/reservations/$(request.resource.data.reservationId)).data.spaceName == request.resource.data.spaceName
+        && getAfter(/databases/$(database)/documents/reservations/$(request.resource.data.reservationId)).data.date == request.resource.data.date);
+      allow update, delete: if isSindico();
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
