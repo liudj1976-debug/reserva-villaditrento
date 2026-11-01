@@ -48,6 +48,12 @@ test('síndico pode administrar configurações', async () => {
   await assertSucceeds(setDoc(doc(db, 'config/prices'), { teste: 1 }));
 });
 test('qualquer usuário lê a disponibilidade, mas apenas uma reserva vinculada pode ocupá-la', async () => {
+  // Garante o preço esperado em config/prices, independente da ordem dos testes
+  // (o teste "síndico pode administrar configurações" sobrescreve esse documento).
+  await env.withSecurityRulesDisabled(async (context) => {
+    await setDoc(doc(context.firestore(), 'config/prices'), { 'Churrasqueira Superior': 81 });
+  });
+
   const resident = env.authenticatedContext('morador-1', { email: 'morador@example.test' }).firestore();
   const availability = doc(resident, 'availability/churrasqueira-superior-2026-10-03');
 
@@ -70,4 +76,50 @@ test('qualquer usuário lê a disponibilidade, mas apenas uma reserva vinculada 
 
   const otherResident = env.authenticatedContext('morador-2', { email: 'outro@example.test' }).firestore();
   await assertSucceeds(getDoc(doc(otherResident, 'availability/churrasqueira-superior-2026-10-03')));
+});
+
+test('morador não pode forjar status ou valor da própria reserva', async () => {
+  await env.withSecurityRulesDisabled(async (context) => {
+    await setDoc(doc(context.firestore(), 'config/prices'), { 'Salão de Festas': 150 });
+  });
+  const resident = env.authenticatedContext('morador-3', { email: 'forjador@example.test' }).firestore();
+
+  // valor diferente do cadastrado em config/prices
+  await assertFails(setDoc(doc(resident, 'reservations/fraude-valor'), {
+    userId: 'morador-3', spaceName: 'Salão de Festas', date: '2026-11-10',
+    apartment: '202', status: 'Pendente', value: 0, createdAt: '2026-10-01T12:00:00.000Z'
+  }));
+
+  // status pulando a aprovação do síndico
+  await assertFails(setDoc(doc(resident, 'reservations/fraude-status'), {
+    userId: 'morador-3', spaceName: 'Salão de Festas', date: '2026-11-10',
+    apartment: '202', status: 'Confirmado', value: 150, createdAt: '2026-10-01T12:00:00.000Z'
+  }));
+
+  // dados corretos: passa
+  await assertSucceeds(setDoc(doc(resident, 'reservations/reserva-valida'), {
+    userId: 'morador-3', spaceName: 'Salão de Festas', date: '2026-11-10',
+    apartment: '202', status: 'Pendente', value: 150, createdAt: '2026-10-01T12:00:00.000Z'
+  }));
+});
+
+test('funcionário só vira portaria se o síndico cadastrou o convite antes', async () => {
+  const semConvite = env.authenticatedContext('func-sem-convite', { email: 'semconvite@example.test' }).firestore();
+  await assertFails(setDoc(doc(semConvite, 'users/func-sem-convite'), {
+    role: 'portaria', email: 'semconvite@example.test'
+  }));
+
+  await env.withSecurityRulesDisabled(async (context) => {
+    await setDoc(doc(context.firestore(), 'staff_invites/comconvite@example.test'), {
+      name: 'Funcionário Teste', role: 'portaria'
+    });
+  });
+  const comConvite = env.authenticatedContext('func-com-convite', { email: 'comconvite@example.test' }).firestore();
+  await assertSucceeds(setDoc(doc(comConvite, 'users/func-com-convite'), {
+    role: 'portaria', email: 'comconvite@example.test'
+  }));
+
+  // só o síndico cadastra/gerencia convites
+  const portariaDb = env.authenticatedContext('portaria-1', { email: 'portaria@example.test' }).firestore();
+  await assertFails(setDoc(doc(portariaDb, 'staff_invites/outro@example.test'), { name: 'X', role: 'portaria' }));
 });

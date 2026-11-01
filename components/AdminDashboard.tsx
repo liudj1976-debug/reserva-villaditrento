@@ -3,6 +3,7 @@ import { Space, Reservation, BlockedDate, SuggestionComplaint } from '../types';
 import { formatCurrency, triggerHaptic } from '../utils/helpers';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import { StaffManagement } from './StaffManagement';
 
 interface AdminDashboardProps {
   user: any;
@@ -361,6 +362,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <button onClick={() => setActiveTab('maintenance')} className={`flex-1 md:flex-none px-4 md:px-8 py-3 rounded-xl font-bold transition whitespace-nowrap flex items-center justify-center gap-2 ${activeTab === 'maintenance' ? 'bg-white dark:bg-neutral-700 shadow-sm text-green-600' : 'text-gray-500'}`}>
             <i className="fas fa-tools text-xs"></i> Manutenção
           </button>
+          <button onClick={() => setActiveTab('staff')} className={`flex-1 md:flex-none px-4 md:px-8 py-3 rounded-xl font-bold transition whitespace-nowrap flex items-center justify-center gap-2 ${activeTab === 'staff' ? 'bg-white dark:bg-neutral-700 shadow-sm text-green-600' : 'text-gray-500'}`}>
+            <i className="fas fa-user-shield text-xs"></i> Funcionários
+          </button>
           {user?.email === 'lizandro.miranda@gmail.com' && (
             <button onClick={() => setActiveTab('mandates')} className={`flex-1 md:flex-none px-4 md:px-8 py-3 rounded-xl font-bold transition whitespace-nowrap flex items-center justify-center gap-2 ${activeTab === 'mandates' ? 'bg-white dark:bg-neutral-700 shadow-sm text-green-600' : 'text-gray-500'}`}>
               <i className="fas fa-user-shield text-xs"></i> Mandatos
@@ -647,6 +651,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
           </div>
         )}
+
+        {activeTab === 'staff' && <StaffManagement />}
 
         {false && activeTab === 'mandates' && (
           <div className="animate-fade-in space-y-6">

@@ -8,11 +8,27 @@ service cloud.firestore {
     function ownsUser(userId) { return signedIn() && request.auth.uid == userId; }
     match /users/{userId} {
       allow get: if ownsUser(userId) || isSindico();
-      allow create: if ownsUser(userId) && request.resource.data.role == 'resident' && request.resource.data.email == request.auth.token.email;
+      allow create: if ownsUser(userId) && request.resource.data.email == request.auth.token.email && (
+        request.resource.data.role == 'resident' ||
+        (request.resource.data.role == 'portaria'
+          && exists(/databases/$(database)/documents/staff_invites/$(request.auth.token.email))
+          && get(/databases/$(database)/documents/staff_invites/$(request.auth.token.email)).data.role == 'portaria')
+      );
       allow update, delete: if isSindico();
       allow list: if isSindico();
     }
-    match /reservations/{reservationId} { allow create: if signedIn() && request.resource.data.userId == request.auth.uid; allow get, list: if isSindico() || (signedIn() && resource.data.userId == request.auth.uid); allow update, delete: if isSindico(); }
+    match /staff_invites/{email} {
+      allow get: if signedIn() && request.auth.token.email == email;
+      allow list, write: if isSindico();
+    }
+    match /reservations/{reservationId} {
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'Pendente'
+        && request.resource.data.value == get(/databases/$(database)/documents/config/prices).data[request.resource.data.spaceName];
+      allow get, list: if isSindico() || (signedIn() && resource.data.userId == request.auth.uid);
+      allow update, delete: if isSindico();
+    }
     match /blocked_dates/{id} { allow read: if true; allow write: if isSindico(); }
     match /config/{id} { allow read: if true; allow write: if isSindico(); }
     match /feedbacks/{id} { allow create: if signedIn() && request.resource.data.userId == request.auth.uid; allow read: if isSindico() || (signedIn() && resource.data.userId == request.auth.uid); allow update, delete: if isSindico(); }

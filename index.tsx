@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import './index.css';
 import ReactDOM from 'react-dom/client';
 import { onAuthStateChanged, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, sendPasswordResetEmail } from 'firebase/auth';
-import { collection, addDoc, onSnapshot, doc, updateDoc, deleteDoc, setDoc, query, where, runTransaction, serverTimestamp, writeBatch } from 'firebase/firestore';
+import { collection, addDoc, onSnapshot, doc, getDoc, updateDoc, deleteDoc, setDoc, query, where, runTransaction, serverTimestamp, writeBatch } from 'firebase/firestore';
 import { auth, db } from './firebase';
 
 // --- Types & Utils ---
@@ -246,8 +246,14 @@ const App = () => {
     try {
       if (isSignUp) {
         const userCred = await createUserWithEmailAndPassword(auth, email, pass);
+        // Se o síndico cadastrou este e-mail como funcionário da portaria (coleção
+        // staff_invites), o próprio cadastro já nasce com o papel 'portaria'.
+        // Caso contrário, nasce como morador comum ('resident'). A regra do
+        // Firestore reforça essa checagem no servidor — o cliente não decide sozinho.
+        const inviteSnap = await getDoc(doc(db, 'staff_invites', userCred.user.email || ''));
+        const invitedRole = inviteSnap.exists() && inviteSnap.data().role === 'portaria' ? 'portaria' : 'resident';
         await setDoc(doc(db, 'users', userCred.user.uid), {
-          role: 'resident', email: userCred.user.email, createdAt: new Date().toISOString()
+          role: invitedRole, email: userCred.user.email, createdAt: new Date().toISOString()
         });
       }
       else await signInWithEmailAndPassword(auth, email, pass);

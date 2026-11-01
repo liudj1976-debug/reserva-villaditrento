@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { collection, addDoc, onSnapshot, updateDoc, doc, deleteDoc, query, orderBy, where, limit, getDocs } from 'firebase/firestore';
+import { collection, addDoc, onSnapshot, updateDoc, doc, deleteDoc, query, orderBy, where, limit, getDocs, writeBatch, arrayUnion, QueryConstraint } from 'firebase/firestore';
 import { db } from '../firebase';
-import { Resident, Package } from '../types';
+import { Resident, Package, PackageItem } from '../types';
 import { AppRole, canAccessPortaria } from '../utils/authorization';
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -33,6 +33,11 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
   const [historyLimit, setHistoryLimit]     = useState(HISTORY_PAGE_SIZE);
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore]       = useState(false);
+  // Quando há busca por texto ou filtro de mês ativo, não dá mais pra confiar
+  // só nas "últimas N encomendas" carregadas (ver nota acima da query uRecent):
+  // esses filtros disparam uma consulta própria direto no Firestore.
+  const [searchResults, setSearchResults]   = useState<Package[] | null>(null);
+  const [isSearching, setIsSearching]       = useState(false);
 
   // UI
   const [tab, setTab]         = useState<'dashboard' | 'new_package' | 'history' | 'residents'>('dashboard');
@@ -41,6 +46,9 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
 
   // Form – new package
   const [pkg, setPkg] = useState({ residentId: '', packageType: '', description: '', observations: '' });
+  // Se o morador escolhido já tem encomenda pendente, oferece consolidar a
+  // foto nova nesse mesmo registro em vez de criar um registro separado.
+  const [consolidate, setConsolidate] = useState(true);
   const [resSearch, setResSearch]       = useState('');
   const [showResDrop, setShowResDrop]   = useState(false);
   const [photoBase64, setPhotoBase64]   = useState<string | null>(null);
@@ -65,7 +73,11 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
   const [waModal, setWaModal] = useState<{ open: boolean; pkg: Package | null; resident: Resident | null }>(
     { open: false, pkg: null, resident: null }
   );
-  const [photoModal, setPhotoModal] = useState<string | null>(null);
+  const [photoModal, setPhotoModal] = useState<string[] | null>(null);
+  // Todas as fotos de um registro (a principal + as consolidadas em items),
+  // na ordem em que chegaram — usado pro modal de galeria.
+  const pkgPhotos = (p: Package): string[] =>
+    [p.photoUrl, ...(p.items?.map(i => i.photoUrl) || [])].filter(Boolean);
 
   // Edit Package State
   const [editPkgModal, setEditPkgModal] = useState<{ open: boolean; pkg: Package | null }>({ open: false, pkg: null });
@@ -121,10 +133,87 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
     return () => { u1(); uPending(); uRecent(); };
   }, [historyLimit]);
 
+  // Migração única e silenciosa: encomendas antigas (de antes dessa correção)
+  // não têm o campo residentNameLower, necessário pra busca por nome funcionar
+  // em todo o histórico. Roda uma vez, só completa os registros que faltam.
+  useEffect(() => {
+    (async () => {
+      try {
+        const snap = await getDocs(query(collection(db, 'packages'), limit(1000)));
+        const toFix = snap.docs.filter(d => !d.data().residentNameLower && d.data().residentName);
+        if (toFix.length === 0) return;
+        // writeBatch suporta no máximo 500 operações por lote.
+        for (let i = 0; i < toFix.length; i += 450) {
+          const batch = writeBatch(db);
+          toFix.slice(i, i + 450).forEach(d => batch.update(d.ref, { residentNameLower: (d.data().residentName as string).toLowerCase() }));
+          await batch.commit();
+        }
+      } catch (err) {
+        console.error('Migração residentNameLower falhou (não impede o uso normal da tela):', err);
+      }
+    })();
+  }, []);
+
   const loadMoreHistory = () => {
     setLoadingMore(true);
     setHistoryLimit(prev => prev + HISTORY_PAGE_SIZE);
   };
+
+  // ── Busca de histórico direto no Firestore ───────────────────────────────
+  // Antes, a busca/filtro de mês só olhava as encomendas já carregadas na tela
+  // (as mais recentes), então um apartamento ou mês antigo "sumia" por nunca
+  // ter sido baixado. Agora, quando algum filtro de busca/mês está ativo, a
+  // consulta vai direto no banco, sem depender da paginação do Histórico.
+  useEffect(() => {
+    const term = hSearch.trim();
+    if (!term && !useMonthFilter) {
+      setSearchResults(null);
+      return;
+    }
+
+    const handle = setTimeout(async () => {
+      setIsSearching(true);
+      try {
+        const constraints: QueryConstraint[] = [];
+        const looksLikeApartment = /^\d/.test(term);
+
+        if (term && looksLikeApartment) {
+          constraints.push(where('apartment', '==', term));
+        } else if (term && /^VT-/i.test(term)) {
+          constraints.push(where('code', '==', term.toUpperCase()));
+        } else if (term) {
+          const t = term.toLowerCase();
+          constraints.push(where('residentNameLower', '>=', t), where('residentNameLower', '<', t + '\uf8ff'));
+        } else if (useMonthFilter) {
+          // Só mês, sem texto: dá pra filtrar o período direto no Firestore.
+          const [y, m] = hMonth.split('-').map(Number);
+          const start = `${hMonth}-01`;
+          const nextMonth = new Date(y, m, 1);
+          const end = `${nextMonth.getFullYear()}-${String(nextMonth.getMonth() + 1).padStart(2, '0')}-01`;
+          constraints.push(where('receivedAt', '>=', start), where('receivedAt', '<', end));
+        }
+
+        const snap = await getDocs(query(collection(db, 'packages'), ...constraints, limit(500)));
+        let results = snap.docs.map(d => ({ id: d.id, ...d.data() } as Package));
+
+        // Mês + texto juntos: o Firestore não permite intervalo em dois campos
+        // ao mesmo tempo, então o filtro de mês é aplicado aqui em cima do
+        // resultado da busca por texto.
+        if (term && useMonthFilter) {
+          results = results.filter(p => p.receivedAt.startsWith(hMonth));
+        }
+
+        setSearchResults(results);
+      } catch (err) {
+        console.error('Erro na busca do histórico:', err);
+        setSearchResults([]);
+      } finally {
+        setIsSearching(false);
+      }
+    }, 350); // debounce: evita 1 consulta por tecla digitada
+
+    return () => clearTimeout(handle);
+  }, [hSearch, useMonthFilter, hMonth]);
 
   // ── Helpers ────────────────────────────────────────────────────────────────
   const flash = (msg: string, type: 'success' | 'error' = 'success') => {
@@ -158,22 +247,41 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
   const totalToday     = packages.filter(p => p.receivedAt.startsWith(today)).length;
   const deliveredToday = packages.filter(p => p.status === 'Entregue' && p.deliveredAt?.startsWith(today)).length;
 
+  // Encomenda pendente mais recente do morador selecionado no formulário de
+  // cadastro (se houver) — base pra oferecer "adicionar a esta encomenda".
+  const existingPendingPkg = pkg.residentId
+    ? pending
+        .filter(p => p.residentId === pkg.residentId)
+        .sort((a, b) => b.receivedAt.localeCompare(a.receivedAt))[0] || null
+    : null;
+
   const filteredRes = residents.filter(r =>
     r.status === 'ativo' &&
     (r.fullName.toLowerCase().includes(resSearch.toLowerCase()) ||
      r.apartment.toLowerCase().includes(resSearch.toLowerCase()))
   );
 
-  const history = packages.filter(p => {
-    const s = hSearch.toLowerCase();
-    const matchText = p.residentName.toLowerCase().includes(s) ||
-                      p.apartment.toLowerCase().includes(s) ||
-                      (p.code || '').toLowerCase().includes(s) ||
-                      (p.description || '').toLowerCase().includes(s);
+  // Base do histórico: se há busca/mês ativo, vem da consulta ao Firestore
+  // (searchResults); senão, vem da lista paginada das mais recentes (packages).
+  const historyBase = searchResults ?? packages;
+  const history = historyBase.filter(p => {
     const matchStatus = hStatus === 'all' || p.status === hStatus;
-    const matchMonth  = !useMonthFilter || p.receivedAt.startsWith(hMonth);
     const matchType   = hType === 'all' || p.packageType === hType;
-    return matchText && matchStatus && matchMonth && matchType;
+    // Quando a própria consulta já veio do Firestore filtrada por texto/mês,
+    // só falta aplicar status e tipo (filtros leves, em memória).
+    // Sem busca/mês ativo, mantém também o filtro de texto livre local,
+    // útil pra refinar dentro das encomendas recentes já carregadas.
+    const matchText = searchResults
+      ? true
+      : (() => {
+          const s = hSearch.toLowerCase();
+          return !s ||
+            p.residentName.toLowerCase().includes(s) ||
+            p.apartment.toLowerCase().includes(s) ||
+            (p.code || '').toLowerCase().includes(s) ||
+            (p.description || '').toLowerCase().includes(s);
+        })();
+    return matchText && matchStatus && matchType;
   });
 
   // Detecta se a busca é por apartamento específico
@@ -203,7 +311,7 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
           <tr style="border-bottom:1px solid #f0f0f0">
             <td style="padding:6px 8px;font-size:12px">${fmtDate(p.receivedAt)}</td>
             <td style="padding:6px 8px;font-size:12px">${p.code || '-'}</td>
-            <td style="padding:6px 8px;font-size:12px">${p.packageType || '-'}${p.description ? ' — ' + p.description : ''}</td>
+            <td style="padding:6px 8px;font-size:12px">${p.packageType || '-'}${p.description ? ' — ' + p.description : ''}${p.items?.length ? ` <strong>(+${p.items.length} pacote${p.items.length > 1 ? 's' : ''})</strong>` : ''}</td>
             <td style="padding:6px 8px;font-size:12px">${p.residentName}</td>
             <td style="padding:6px 8px;font-size:12px;font-weight:bold;color:${p.status === 'Entregue' ? '#16a34a' : p.status === 'Notificado' ? '#d97706' : '#2563eb'}">${p.status}</td>
             <td style="padding:6px 8px;font-size:12px">${p.deliveredToName || '-'}</td>
@@ -270,9 +378,16 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
       ? `Outro (${p.description})`
       : (p.packageType || p.description);
 
+    // Quando há encomendas consolidadas no mesmo registro, lista todas no aviso.
+    const extraCount = p.items?.length || 0;
+    const itemsList = extraCount
+      ? `\n\n*Esta encomenda tem ${extraCount + 1} pacotes juntos:*\n` +
+        [`1. ${typeLabel}`, ...p.items!.map((it, i) => `${i + 2}. ${(it.packageType === 'Outro' && it.description) ? `Outro (${it.description})` : (it.packageType || it.description)}`)].join('\n')
+      : '';
+
     const msg = isFood
       ? `🍔 *ENTREGA DE COMIDA* (Cod: ${p.code})\n\nOlá ${r.fullName}!\nSua entrega de comida (*iFood / 99 Food*) chegou na portaria do *Villa Di Trento*!\n\n⚠️ _Como se trata de alimento, por favor, retire na portaria o quanto antes para não esfriar/estragar._\n\n*Apto:* ${p.apartment}\n\n${p.photoUrl ? '_📸 Uma foto da entrega foi registrada no sistema por segurança._\n\n' : ''}Por favor, informe o código *${p.code}* ao retirar.`
-      : `📦 *ENCOMENDA REGISTRADA* (Cod: ${p.code})\n\nOlá ${r.fullName}!\nSua encomenda chegou na portaria do *Villa Di Trento*.\n\n*Tipo:* ${typeLabel}\n*Apto:* ${p.apartment}\n\n${p.photoUrl ? '_📸 Uma foto da encomenda foi registrada no sistema por segurança._\n\n' : ''}Por favor, informe o código *${p.code}* ao retirar.\n\n---\n⚠️ *Nota:* Conforme a *Lei RJ 9.226/26*, as entregas devem ser recebidas na portaria para maior segurança de todos.`;
+      : `📦 *ENCOMENDA REGISTRADA* (Cod: ${p.code})\n\nOlá ${r.fullName}!\nSua encomenda chegou na portaria do *Villa Di Trento*.\n\n*Tipo:* ${typeLabel}\n*Apto:* ${p.apartment}${itemsList}\n\n${p.photoUrl ? '_📸 Foto(s) da(s) encomenda(s) foram registradas no sistema por segurança._\n\n' : ''}Por favor, informe o código *${p.code}* ao retirar.\n\n---\n⚠️ *Nota:* Conforme a *Lei RJ 9.226/26*, as entregas devem ser recebidas na portaria para maior segurança de todos.`;
 
     const phone = r.phone.replace(/\D/g, '');
     const finalPhone = phone.startsWith('55') ? phone : `55${phone}`;
@@ -319,19 +434,30 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
       // Usar a foto em Base64 já comprimida diretamente no Banco (em vez de usar o Storage)
       const photoUrl = photoBase64 || '';
 
-      const pkgCode = Math.random().toString(36).substring(2, 6).toUpperCase();
-
-      await addDoc(collection(db, 'packages'), {
-        code: `VT-${pkgCode}`,
-        residentId: resident.id, residentName: resident.fullName, apartment: resident.apartment,
-        packageType: pkg.packageType, description: pkg.description,
-        observations: pkg.observations, photoUrl,
-        receivedAt: new Date().toISOString(), status: 'Recebido'
-      });
+      if (consolidate && existingPendingPkg) {
+        // Morador já tem encomenda pendente: anexa esta como mais um item do
+        // mesmo registro, em vez de criar uma encomenda separada.
+        const item: PackageItem = {
+          photoUrl, packageType: pkg.packageType,
+          description: pkg.description || '', receivedAt: new Date().toISOString()
+        };
+        await updateDoc(doc(db, 'packages', existingPendingPkg.id), { items: arrayUnion(item) });
+        flash('Encomenda adicionada ao registro existente deste morador! 📦');
+      } else {
+        const pkgCode = Math.random().toString(36).substring(2, 6).toUpperCase();
+        await addDoc(collection(db, 'packages'), {
+          code: `VT-${pkgCode}`,
+          residentId: resident.id, residentName: resident.fullName, apartment: resident.apartment,
+          residentNameLower: resident.fullName.toLowerCase(),
+          packageType: pkg.packageType, description: pkg.description,
+          observations: pkg.observations, photoUrl,
+          receivedAt: new Date().toISOString(), status: 'Recebido'
+        });
+        flash('Encomenda registrada com sucesso! 📦');
+      }
       setPkg({ residentId: '', packageType: '', description: '', observations: '' });
-      setResSearch(''); setPhotoBase64(null); setIsCompressing(false);
+      setResSearch(''); setPhotoBase64(null); setIsCompressing(false); setConsolidate(true);
       if (fileInputRef.current) fileInputRef.current.value = '';
-      flash('Encomenda registrada com sucesso! 📦');
       setTab('dashboard');
     } catch (err: any) {
       flash(`Erro: ${err.message || 'Desconhecido'}`, 'error');
@@ -360,6 +486,7 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
       await updateDoc(doc(db, 'packages', editPkgModal.pkg.id), {
         residentId: resident.id,
         residentName: resident.fullName,
+        residentNameLower: resident.fullName.toLowerCase(),
         apartment: resident.apartment,
         packageType: editPkgData.packageType,
         description: editPkgData.description,
@@ -536,13 +663,17 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
                     return (
                       <div key={p.id} className={`p-4 rounded-xl border flex items-center gap-4 transition ${old?'bg-red-50 dark:bg-red-900/10 border-red-200 dark:border-red-800/30':'bg-white dark:bg-neutral-900 border-gray-100 dark:border-neutral-800'}`}>
                         {p.photoUrl
-                          ? <img src={p.photoUrl} className="w-14 h-14 rounded-xl object-cover flex-shrink-0 shadow-sm border cursor-pointer hover:opacity-80 transition" alt="" onClick={() => setPhotoModal(p.photoUrl)} />
+                          ? <div className="relative flex-shrink-0">
+                              <img src={p.photoUrl} className="w-14 h-14 rounded-xl object-cover shadow-sm border cursor-pointer hover:opacity-80 transition" alt="" onClick={() => setPhotoModal(pkgPhotos(p))} />
+                              {!!p.items?.length && <span className="absolute -top-1.5 -right-1.5 bg-indigo-600 text-white text-[10px] font-bold w-5 h-5 rounded-full flex items-center justify-center shadow">+{p.items.length}</span>}
+                            </div>
                           : <div className="w-14 h-14 bg-gray-100 dark:bg-neutral-800 rounded-xl flex items-center justify-center flex-shrink-0"><i className="fas fa-box text-gray-400 text-xl"></i></div>}
                         <div className="flex-1 min-w-0">
                           <div className="flex flex-wrap items-center gap-2 mb-0.5">
                             <p className="font-bold truncate">{p.residentName}</p>
                             <span className="text-xs bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 px-2 py-0.5 rounded-full font-bold flex-shrink-0">Apto {p.apartment}</span>
                             {p.code && <span className="text-xs bg-indigo-100 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-400 px-2 py-0.5 rounded-full font-black border border-indigo-200 dark:border-indigo-800">{p.code}</span>}
+                            {!!p.items?.length && <span className="text-xs bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 px-2 py-0.5 rounded-full font-bold flex-shrink-0">{p.items.length + 1} encomendas</span>}
                             {p.notifiedAt && <span className="text-xs text-green-600 dark:text-green-400 font-medium"><i className="fab fa-whatsapp mr-1"></i>Notif. {fmtDate(p.notifiedAt)}</span>}
                           </div>
                           <p className="text-sm text-gray-500 truncate">{p.packageType || p.description}</p>
@@ -633,6 +764,21 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
                   </div>
                 )}
               </div>
+
+              {/* Aviso de encomenda pendente já existente para este morador */}
+              {existingPendingPkg && (
+                <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl p-4">
+                  <label className="flex items-start gap-3 cursor-pointer">
+                    <input type="checkbox" checked={consolidate} onChange={e => setConsolidate(e.target.checked)}
+                      className="mt-1 w-5 h-5 accent-amber-600 flex-shrink-0" />
+                    <span className="text-sm text-amber-800 dark:text-amber-300">
+                      <strong>Apto {existingPendingPkg.apartment}</strong> já tem uma encomenda pendente
+                      (registrada em {fmtDate(existingPendingPkg.receivedAt)}{existingPendingPkg.items?.length ? `, já com ${existingPendingPkg.items.length} foto(s) extra` : ''}).
+                      Marcado, esta nova foto <strong>entra no mesmo registro</strong> (recomendado). Desmarque pra criar uma encomenda separada.
+                    </span>
+                  </label>
+                </div>
+              )}
 
               {/* Tipo */}
               <div>
@@ -787,13 +933,17 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
                   <div key={p.id} className={`p-4 rounded-xl border flex flex-col sm:flex-row gap-4 transition ${old?'bg-red-50 dark:bg-red-900/10 border-red-200 dark:border-red-900/30':'bg-white dark:bg-neutral-900 border-gray-100 dark:border-neutral-800'}`}>
                     <div className="flex items-start gap-4 flex-1 min-w-0">
                       {p.photoUrl
-                        ? <img src={p.photoUrl} className="w-16 h-16 rounded-xl object-cover flex-shrink-0 shadow-sm border cursor-pointer hover:opacity-80 transition" alt="" onClick={() => setPhotoModal(p.photoUrl)} />
+                        ? <div className="relative flex-shrink-0">
+                            <img src={p.photoUrl} className="w-16 h-16 rounded-xl object-cover shadow-sm border cursor-pointer hover:opacity-80 transition" alt="" onClick={() => setPhotoModal(pkgPhotos(p))} />
+                            {!!p.items?.length && <span className="absolute -top-1.5 -right-1.5 bg-indigo-600 text-white text-[10px] font-bold w-5 h-5 rounded-full flex items-center justify-center shadow">+{p.items.length}</span>}
+                          </div>
                         : <div className="w-16 h-16 bg-gray-100 dark:bg-neutral-800 rounded-xl flex items-center justify-center flex-shrink-0"><i className="fas fa-box text-gray-400 text-2xl"></i></div>}
                       <div className="flex-1 min-w-0">
                         <div className="flex flex-wrap items-center gap-2 mb-1">
                           <p className="font-bold">{p.residentName}</p>
                           <span className="text-xs bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 px-2 py-0.5 rounded-full font-bold">Apto {p.apartment}</span>
                           {p.code && <span className="text-xs bg-indigo-100 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-400 px-2 py-0.5 rounded-full font-black border border-indigo-200 dark:border-indigo-800">{p.code}</span>}
+                          {!!p.items?.length && <span className="text-xs bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 px-2 py-0.5 rounded-full font-bold">{p.items.length + 1} encomendas</span>}
                           <span className={`text-xs px-2 py-0.5 rounded-full font-bold ${p.status==='Recebido'?'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400':p.status==='Notificado'?'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400':'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'}`}>{p.status}</span>
                           {old && <span className="text-xs bg-red-100 text-red-600 dark:bg-red-900/20 dark:text-red-400 px-2 py-0.5 rounded-full font-bold"><i className="fas fa-hourglass-end mr-1"></i>{days}d sem retirada</span>}
                         </div>
@@ -828,20 +978,29 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
                   </div>
                 );
               })}
-              {history.length === 0 && (
+              {isSearching && (
+                <div className="p-8 text-center text-gray-400">
+                  <i className="fas fa-spinner fa-spin text-2xl mb-2 block"></i>
+                  <p className="text-sm">Buscando no histórico completo...</p>
+                </div>
+              )}
+              {!isSearching && history.length === 0 && (
                 <div className="p-12 text-center text-gray-500">
                   <i className="fas fa-search text-4xl mb-4 block text-gray-300"></i>
                   <p>Nenhuma encomenda encontrada.</p>
                 </div>
               )}
-              {history.length > 0 && hasMoreHistory && (
+              {!isSearching && history.length > 0 && !searchResults && hasMoreHistory && (
                 <div className="pt-2 text-center">
                   <button onClick={loadMoreHistory} disabled={loadingMore}
                     className="px-6 py-3 bg-gray-100 dark:bg-neutral-800 hover:bg-gray-200 dark:hover:bg-neutral-700 text-gray-700 dark:text-gray-300 font-bold rounded-xl transition disabled:opacity-50 text-sm">
                     {loadingMore ? <><i className="fas fa-spinner fa-spin mr-2"></i>Carregando...</> : <><i className="fas fa-history mr-2"></i>Carregar encomendas mais antigas</>}
                   </button>
-                  <p className="text-xs text-gray-400 mt-2">Mostrando as {packages.length} encomendas mais recentes. A busca acima funciona apenas dentro do que já foi carregado.</p>
+                  <p className="text-xs text-gray-400 mt-2">Mostrando as {packages.length} encomendas mais recentes. Use a busca ou o filtro de mês acima para encontrar encomendas mais antigas.</p>
                 </div>
+              )}
+              {!isSearching && searchResults && searchResults.length > 0 && (
+                <p className="text-xs text-center text-gray-400 pt-2">Busca feita em todo o histórico de encomendas, não só nas mais recentes.</p>
               )}
             </div>
           </div>
@@ -976,11 +1135,20 @@ export const PackageManagement: React.FC<Props> = ({ onBack, role }) => {
           MODAL — FOTO AMPLIADA
       ════════════════════════════════════════════════════════════════════ */}
       {photoModal && (
-        <div className="fixed inset-0 bg-black/95 z-[60] flex items-center justify-center p-4 backdrop-blur-md animate-fade-in" onClick={() => setPhotoModal(null)}>
-          <button className="absolute top-4 right-4 text-white w-12 h-12 flex items-center justify-center hover:bg-white/10 rounded-full transition" onClick={() => setPhotoModal(null)}>
+        <div className="fixed inset-0 bg-black/95 z-[60] flex items-center justify-center p-4 backdrop-blur-md animate-fade-in overflow-y-auto" onClick={() => setPhotoModal(null)}>
+          <button className="fixed top-4 right-4 text-white w-12 h-12 flex items-center justify-center hover:bg-white/10 rounded-full transition z-10" onClick={() => setPhotoModal(null)}>
             <i className="fas fa-times text-2xl"></i>
           </button>
-          <img src={photoModal} className="max-w-full max-h-[90vh] object-contain rounded-xl shadow-2xl" alt="Encomenda" onClick={e => e.stopPropagation()} />
+          {photoModal.length > 1 && (
+            <p className="fixed top-6 left-1/2 -translate-x-1/2 text-white/80 text-sm font-bold bg-black/40 px-3 py-1 rounded-full">
+              {photoModal.length} encomendas consolidadas neste registro
+            </p>
+          )}
+          <div className={`flex ${photoModal.length > 1 ? 'flex-col gap-4 py-10' : ''} items-center justify-center max-w-full`} onClick={e => e.stopPropagation()}>
+            {photoModal.map((url, i) => (
+              <img key={i} src={url} className="max-w-full max-h-[85vh] object-contain rounded-xl shadow-2xl" alt="Encomenda" />
+            ))}
+          </div>
         </div>
       )}
 
