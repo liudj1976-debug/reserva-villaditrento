@@ -186,13 +186,22 @@ export const StaffManagement: React.FC = () => {
                     </button>
                   )}
                   {status === 'revogado' && account && (
-                    <button
-                      onClick={() => handleReactivate(account.uid)}
-                      className="w-10 h-10 rounded-full bg-green-500 hover:bg-green-600 text-white flex items-center justify-center shadow-sm transition"
-                      title="Reativar acesso"
-                    >
-                      <i className="fas fa-user-check"></i>
-                    </button>
+                    <>
+                      <button
+                        onClick={() => handleReactivate(account.uid)}
+                        className="w-10 h-10 rounded-full bg-green-500 hover:bg-green-600 text-white flex items-center justify-center shadow-sm transition"
+                        title="Reativar acesso"
+                      >
+                        <i className="fas fa-user-check"></i>
+                      </button>
+                      <button
+                        onClick={() => handleCancelInvite(inv.email)}
+                        className="w-10 h-10 rounded-full bg-red-500 hover:bg-red-600 text-white flex items-center justify-center shadow-sm transition"
+                        title="Remover da lista (a conta continua revogada; para reativar depois, cadastre o funcionário de novo)"
+                      >
+                        <i className="fas fa-trash-alt"></i>
+                      </button>
+                    </>
                   )}
                   {status === 'pendente' && (
                     <button
